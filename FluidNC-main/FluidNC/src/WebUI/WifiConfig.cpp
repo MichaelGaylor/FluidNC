@@ -24,16 +24,100 @@
 #include "Driver/localfs.h"
 #include <string>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 
 #include <esp_ota_ops.h>
 
 namespace WebUI {
 
-
 // Forward declarations for helper commands (defined later in this file)
 static Error showPasswordState(const char* parameter, AuthenticationLevel auth_level, Channel& out);
 static Error setStaPasswordAndConfirm(const char* parameter, AuthenticationLevel auth_level, Channel& out);
 static Error showStaPasswordPlain(const char* parameter, AuthenticationLevel auth_level, Channel& out);
+
+// ---------- Small local helpers (sanitizers & utils) ----------
+static inline std::string trim_copy(std::string s) {
+    auto notspace = [](int ch){ return !std::isspace(ch); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
+    // strip matching quotes if present
+    if (s.size() >= 2 && ((s.front()=='"' && s.back()=='"') || (s.front()=='\'' && s.back()=='\''))) {
+        s = s.substr(1, s.size()-2);
+    }
+    return s;
+}
+
+static inline std::string tolower_copy(const std::string& s) {
+    std::string out(s);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c){ return std::tolower(c); });
+    return out;
+}
+
+// Extract a clean password from potentially bad input like:
+//  - "PASS=secret", "Password=secret", "SSID=MyWiFi PASS=secret", "SSID=MyWiFi,PASS=secret"
+//  - "MyWiFiSECRET" (concatenated) -> if current SSID is prefix, keep suffix
+// Returns trimmed, cleaned password string.
+static std::string extract_password_only(std::string raw, const char* current_ssid) {
+    raw = trim_copy(raw);
+    if (raw.empty()) return raw;
+
+    std::string low = tolower_copy(raw);
+
+    // Case 1: explicit PASS=... or PASSWORD=...
+    auto find_token_value = [&](const std::string& key)->std::string {
+        auto pos = low.find(key);
+        if (pos == std::string::npos) return std::string();
+        pos = static_cast<size_t>(pos + key.size());
+        // skip separators and spaces
+        while (pos < raw.size() && (raw[pos]==' ' || raw[pos]=='\t' || raw[pos]=='=' || raw[pos]==':' )) pos++;
+        // read until comma/space/end
+        size_t end = pos;
+        while (end < raw.size() && raw[end] != ',' && raw[end] != ';' && raw[end] != ' ' && raw[end] != '\t' && raw[end] != '\r' && raw[end] != '\n')
+            end++;
+        return trim_copy(raw.substr(pos, end-pos));
+    };
+
+    // Prefer PASS= / PASSWORD=
+    {
+        std::string v = find_token_value("pass");
+        if (!v.empty()) return v;
+    }
+    {
+        std::string v = find_token_value("password");
+        if (!v.empty()) return v;
+    }
+
+    // Case 2: combined "SSID=... PASS=..."  (PASS not found above -> try to split by PASS marker patterns)
+    if (low.find("ssid") != std::string::npos) {
+        // try to find after last occurrence of "pass" or "password"
+        size_t p = low.rfind("pass");
+        if (p != std::string::npos) {
+            // take substring after that token
+            std::string v = find_token_value("pass");
+            if (!v.empty()) return v;
+        }
+    }
+
+    // Case 3: concatenated "<ssid><password>"
+    if (current_ssid && *current_ssid) {
+        std::string ssid(current_ssid);
+        if (raw.size() > ssid.size() && raw.rfind(ssid, 0) == 0) {
+            std::string suffix = raw.substr(ssid.size());
+            suffix = trim_copy(suffix);
+            if (suffix.size() >= 1) { // don't enforce 8 here; let validator do it
+                log_info(std::string("Sanitizer: detected SSID prefix in password field; using suffix of length ")
+                         + std::to_string((int)suffix.size()));
+                return suffix;
+            }
+        }
+    }
+
+    // Default: return as-is (already trimmed)
+    return raw;
+}
+
+// --------------------------------------------------------------
 
     enum WiFiStartupMode {
         WiFiOff = 0,
@@ -181,35 +265,29 @@ static Error showStaPasswordPlain(const char* parameter, AuthenticationLevel aut
     };
 
     class PasswordSetting : public StringSetting {
-public:
-    PasswordSetting(const char* description, const char* grblName, const char* name, const char* defVal) :
-        // min=0 so empty "" is allowed to clear (OPEN); max unchanged
-        StringSetting(description, WEBSET, WA, grblName, name, defVal, 0 /*min*/, MAX_PASSWORD_LENGTH) {
-        load();
-    }
-    // UI default shows nothing (not stars)
-    const char* getDefaultString() { return ""; }
-    // For UI display: show stars only if a secret actually exists; otherwise show empty.
-    const char* getStringValue() {
-        static const char* masked = "********";
-        const char* cur = get(); // actual stored value (not exposed)
-        return (cur && *cur) ? masked : "";
-    }
-    // Accept "********" as NO-CHANGE sentinel, allow clear(""), require >=8 only for non-empty
-    Error setStringValue(std::string_view s) {
-        if (s == "********") {
-            return Error::Ok; // unchanged
+    public:
+        PasswordSetting(const char* description, const char* grblName, const char* name, const char* defVal) :
+            StringSetting(description, WEBSET, WA, grblName, name, defVal, 0 /*min*/, MAX_PASSWORD_LENGTH) { load(); }
+        const char* getDefaultString() { return ""; }
+        const char* getStringValue() {
+            static const char* masked = "********";
+            const char* cur = get();
+            return (cur && *cur) ? masked : "";
         }
-        if (s.empty()) {
-            // explicit clear to OPEN
-            return StringSetting::setStringValue(s);
-        }
-        if (s.size() < 8) {
-            return Error::InvalidValue;
-        }
-        return StringSetting::setStringValue(s);
-    }
-};
+        Error setStringValue(std::string_view s) {
+    bool all_stars = !s.empty();
+    for (char c : s) { if (c != '*') { all_stars = false; break; } }
+    if (all_stars) return Error::Ok;                         // unchanged
+    if (s.empty())  return StringSetting::setStringValue(s); // clear
+
+    // Generic sanitize (strip PASS=..., quotes, etc.) WITHOUT SSID context here
+    // SSID-aware cleaning is applied later in setStaPasswordAndConfirm() and StartSTA()
+    std::string cleaned = extract_password_only(std::string(s), nullptr);
+    if ((int)cleaned.size() < MIN_PASSWORD_LENGTH) return Error::InvalidValue;
+
+    return StringSetting::setStringValue(cleaned);
+}
+    };
 
     class HostnameSetting : public StringSetting {
     public:
@@ -625,81 +703,29 @@ public:
 
             // We do not check the SD presence here because if the SD card is out,
             // WebUI will switch to M20 for SD access, which is wrong for FluidNC
-        s << "Direct SD";
+            s << "Direct SD";
 
-        s << "  # primary sd:";
+            s << "  # primary sd:";
 
-        (config->_sdCard->config_ok) ? s << "/sd" : s << "none";
+            (config->_sdCard->config_ok) ? s << "/sd" : s << "none";
 
-        s << " # secondary sd:none ";
+            s << " # secondary sd:none ";
 
-        s << " # authentication:";
-        #ifdef ENABLE_AUTHENTICATION
-                    s << "yes";
-        #else
-                    s << "no";
-        #endif
-                    s << " # webcommunication: Sync: ";
-                    s << std::to_string(Web_Server::port() + 1);
-        #if 0
-                    // If we omit the explicit IP address for the websocket,
-                    // WebUI will use the same IP address that it uses for
-                    // HTTP, with the port number as above.  That is better
-                    // than providing an explicit address, because if the WiFi
-                    // drops and comes back up again, DHCP might assign a
-                    // different IP address so the one provided below would no
-                    // longer work.  But if we are using an MDNS address like
-                    // fluidnc.local, a websocket reconnection will succeed
-                    // because MDNS will offer the new IP address.
-                    s << ":";
-                    switch (WiFi.getMode()) {
-                        case WIFI_AP:
-                            s << IP_string(WiFi.softAPIP());
-                            break;
-                        case WIFI_STA:
-                            s << IP_string(WiFi.localIP());
-                            break;
-                        case WIFI_AP_STA:
-                            s << IP_string(WiFi.softAPIP());
-                            break;
-                        default:
-                            s << "0.0.0.0";
-                            break;
-                    }
-        #endif
-                    s << " # axis:" << Axes::_numberAxis;
-                    return Error::Ok;
-                }
+            s << " # authentication:";
+#ifdef ENABLE_AUTHENTICATION
+            s << "yes";
+#else
+            s << "no";
+#endif
+            s << " # webcommunication: Sync: ";
+            s << std::to_string(Web_Server::port() + 1);
+            s << " # axis:" << Axes::_numberAxis;
+            return Error::Ok;
+        }
 
-                /**
-             * WiFi events
-             * SYSTEM_EVENT_WIFI_READY               < ESP32 WiFi ready
-             * SYSTEM_EVENT_SCAN_DONE                < ESP32 finish scanning AP
-             * SYSTEM_EVENT_STA_START                < ESP32 station start
-             * SYSTEM_EVENT_STA_STOP                 < ESP32 station stop
-             * SYSTEM_EVENT_STA_CONNECTED            < ESP32 station connected to AP
-             * SYSTEM_EVENT_STA_DISCONNECTED         < ESP32 station disconnected from AP
-             * SYSTEM_EVENT_STA_AUTHMODE_CHANGE      < the auth mode of AP connected by ESP32 station changed
-             * SYSTEM_EVENT_STA_GOT_IP               < ESP32 station got IP from connected AP
-             * SYSTEM_EVENT_STA_LOST_IP              < ESP32 station lost IP and the IP is reset to 0
-             * SYSTEM_EVENT_STA_WPS_ER_SUCCESS       < ESP32 station wps succeeds in enrollee mode
-             * SYSTEM_EVENT_STA_WPS_ER_FAILED        < ESP32 station wps fails in enrollee mode
-             * SYSTEM_EVENT_STA_WPS_ER_TIMEOUT       < ESP32 station wps timeout in enrollee mode
-             * SYSTEM_EVENT_STA_WPS_ER_PIN           < ESP32 station wps pin code in enrollee mode
-             * SYSTEM_EVENT_AP_START                 < ESP32 soft-AP start
-             * SYSTEM_EVENT_AP_STOP                  < ESP32 soft-AP stop
-             * SYSTEM_EVENT_AP_STACONNECTED          < a station connected to ESP32 soft-AP
-             * SYSTEM_EVENT_AP_STADISCONNECTED       < a station disconnected from ESP32 soft-AP
-             * SYSTEM_EVENT_AP_PROBEREQRECVED        < Receive probe request packet in soft-AP interface
-             * SYSTEM_EVENT_GOT_IP6                  < ESP32 station or ap or ethernet interface v6IP addr is preferred
-             * SYSTEM_EVENT_ETH_START                < ESP32 ethernet start
-             * SYSTEM_EVENT_ETH_STOP                 < ESP32 ethernet stop
-             * SYSTEM_EVENT_ETH_CONNECTED            < ESP32 ethernet phy link up
-             * SYSTEM_EVENT_ETH_DISCONNECTED         < ESP32 ethernet phy link down
-             * SYSTEM_EVENT_ETH_GOT_IP               < ESP32 ethernet got IP from connected AP
-             * SYSTEM_EVENT_MAX
-             */
-
+        /**
+         * WiFi events
+         */
         static void WiFiEvent(WiFiEvent_t event) {
             static bool disconnect_seen = false;
             switch (event) {
@@ -736,112 +762,121 @@ public:
         }
 
         static bool ConnectSTA2AP(const char* SSID, const char* password) {
-    static constexpr uint32_t CONNECT_WINDOW_MS = 20000; // 20s like the sketch
-    static constexpr int      MAX_ATTEMPTS      = 3;
+            static constexpr uint32_t CONNECT_WINDOW_MS = 15000;
+            static constexpr int      MAX_ATTEMPTS      = 1;
 
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
-        // Fresh attempt each pass
-        WiFi.disconnect(true /*wifioff*/, false /*erase*/);
-        delay_ms(200);
+            for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+                WiFi.disconnect(true /*wifioff*/, false /*erase*/);
+                delay_ms(200);
 
-        // Use the IDF cfg we just set; WiFi.begin() with args also fine
-        if (password && *password) { char buf[48]; snprintf(buf, sizeof(buf), "STA password len=%d", (int)strlen(password)); log_info(buf); } else { log_info("STA password is empty"); } WiFi.begin(SSID, (password && *password) ? password : NULL);
+                if (password && *password) {
+                    char buf[48];
+                    snprintf(buf, sizeof(buf), "STA password len=%d", (int)strlen(password));
+                    log_info(buf);
+                } else {
+                    log_info("STA password is empty");
+                }
+                WiFi.begin(SSID, (password && *password) ? password : NULL);
 
-        uint32_t t0 = millis();
-        wl_status_t last = (wl_status_t)255;
+                uint32_t t0 = millis();
+                wl_status_t last = (wl_status_t)255;
 
-        while (millis() - t0 < CONNECT_WINDOW_MS) {
-            wl_status_t s = WiFi.status();
-            if (s != last) { last = s; log_info(std::string("WiFi status=") + std::to_string((int)s)); }
-            if (s == WL_CONNECTED) {
-                log_info("Connected - IP is " << IP_string(WiFi.localIP()) << "  CH=" << WiFi.channel());
-                return true;
+                while (millis() - t0 < CONNECT_WINDOW_MS) {
+                    wl_status_t s = WiFi.status();
+                    if (s != last) { last = s; log_info(std::string("WiFi status=") + std::to_string((int)s)); }
+                    if (s == WL_CONNECTED) {
+                        log_info("Connected - IP is " << IP_string(WiFi.localIP()) << "  CH=" << WiFi.channel());
+                        return true;
+                    }
+                    log_info("Connecting" + std::string((millis()/400)%4, '.'));
+                    delay_ms(200);
+                }
+
+                log_warn("STA connect window timed out; retrying...");
+                delay_ms(500 + attempt * 500);
             }
-            // heartbeat, no early abort on NO_SSID/CONNECT_FAILED
-            log_info("Connecting" + std::string((millis()/400)%4, '.'));
-            delay_ms(200);
+
+            log_error("STA connect failed after retries");
+            return false;
         }
 
-        log_warn("STA connect window timed out; retrying...");
-        delay_ms(500 + attempt * 500);
-    }
-
-    log_error("STA connect failed after retries");
-    return false;
-}
-
-
         static bool StartSTA() {
-    // Leave any existing modes cleanly
-    auto mode = WiFi.getMode();
-    if (mode == WIFI_STA || mode == WIFI_AP_STA) { WiFi.disconnect(); }
-    if (mode == WIFI_AP  || mode == WIFI_AP_STA) { WiFi.softAPdisconnect(); }
-    WiFi.enableAP(false);
+            // Leave any existing modes cleanly
+            auto mode = WiFi.getMode();
+            if (mode == WIFI_STA || mode == WIFI_AP_STA) { WiFi.disconnect(); }
+            if (mode == WIFI_AP  || mode == WIFI_AP_STA) { WiFi.softAPdisconnect(); }
+            WiFi.enableAP(false);
 
-    // SSID must be set
-    const char* SSID = _sta_ssid->get();
-    if (!SSID || strlen(SSID) == 0) {
-        log_info("STA SSID is not set");
-        return false;
-    }
+            // SSID must be set
+            const char* SSID = _sta_ssid->get();
+            if (!SSID || strlen(SSID) == 0) {
+                log_info("STA SSID is not set");
+                return false;
+            }
 
-    // Match the reliable sketch behaviour
-    WiFi.persistent(false);
-    WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE);
+            WiFi.persistent(false);
+            WiFi.setSleep(false);
+            esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Hostname must be set before mode to take effect
-    WiFi.setHostname(_hostname->get());
-    WiFi.mode(WIFI_STA);
-    WiFi.setMinSecurity(static_cast<wifi_auth_mode_t>(_sta_min_security->get()));
-    WiFi.setAutoReconnect(true);
+            // Hostname must be set before mode to take effect
+            WiFi.setHostname(_hostname->get());
+            WiFi.mode(WIFI_STA);
+            WiFi.setMinSecurity(static_cast<wifi_auth_mode_t>(_sta_min_security->get()));
+            WiFi.setAutoReconnect(true);
 
-    // === EXACT knobs from the working sketch ===
-    // Keep creds in RAM only
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+            // Keep creds in RAM only
+            esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
-    // UK/EU channels 1–13
-    wifi_country_t gb = { .cc = "GB", .schan = 1, .nchan = 13, .max_tx_power = 78, .policy = WIFI_COUNTRY_POLICY_MANUAL };
-    esp_wifi_set_country(&gb);
+            // UK/EU channels 1–13 (avoid C99 designated init in C++)
+            wifi_country_t gb;
+            memset(&gb, 0, sizeof(gb));
+            gb.schan = 1;
+            gb.nchan = 13;
+            gb.max_tx_power = 78;
+            gb.policy = WIFI_COUNTRY_POLICY_MANUAL;
+            gb.cc[0] = 'G'; gb.cc[1] = 'B'; gb.cc[2] = '\0';
+            esp_wifi_set_country(&gb);
 
-    // Protocol + bandwidth
-    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+            // Protocol + bandwidth
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+            esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 
-    // PMF: capable but NOT required (fixes WPA3-transition APs)
-    wifi_config_t cfg{};
-    esp_wifi_get_config(WIFI_IF_STA, &cfg);
-    cfg.sta.pmf_cfg.capable  = true;
-    cfg.sta.pmf_cfg.required = false;
+            // PMF: capable but NOT required (fixes WPA3-transition APs)
+            wifi_config_t cfg{};
+            esp_wifi_get_config(WIFI_IF_STA, &cfg);
+            cfg.sta.pmf_cfg.capable  = true;
+            cfg.sta.pmf_cfg.required = false;
 
-    // Force ALL-CHANNEL scan; be permissive with thresholds
-    cfg.sta.scan_method        = WIFI_ALL_CHANNEL_SCAN;
-    cfg.sta.sort_method        = WIFI_CONNECT_AP_BY_SIGNAL;
-    cfg.sta.threshold.rssi     = -127;
-    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+            // Force ALL-CHANNEL scan; be permissive with thresholds
+            cfg.sta.scan_method        = WIFI_ALL_CHANNEL_SCAN;
+            cfg.sta.sort_method        = WIFI_CONNECT_AP_BY_SIGNAL;
+            cfg.sta.threshold.rssi     = -127;
+            cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
-    // Fill SSID/PASS into IDF config so WiFi.begin() can use it
-    const char* password = _sta_password->get();
-    strlcpy((char*)cfg.sta.ssid,     SSID, sizeof(cfg.sta.ssid));
-    strlcpy((char*)cfg.sta.password, (password && *password) ? password : "", sizeof(cfg.sta.password));
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+            // Fill SSID/PASS into IDF config so WiFi.begin() can use it
+            const char* stored_pass = _sta_password->get();
+            std::string clean_pass = extract_password_only(stored_pass ? std::string(stored_pass) : std::string(), SSID);
 
-    // DHCP / Static config
-    int8_t  IP_mode = _sta_mode->get();
-    int32_t IP      = _sta_ip->get();
-    int32_t GW      = _sta_gateway->get();
-    int32_t MK      = _sta_netmask->get();
-    if (IP_mode != DHCP_MODE) {
-        IPAddress ip(IP), mask(MK), gateway(GW);
-        WiFi.config(ip, gateway, mask);
-    }
+            strlcpy((char*)cfg.sta.ssid,     SSID, sizeof(cfg.sta.ssid));
+            strlcpy((char*)cfg.sta.password, clean_pass.c_str(), sizeof(cfg.sta.password));
+            esp_wifi_set_config(WIFI_IF_STA, &cfg);
 
-    // Optional: TX power (fine to keep)
-    esp_wifi_set_max_tx_power(78);
+            // DHCP / Static config
+            int8_t  IP_mode = _sta_mode->get();
+            int32_t IP      = _sta_ip->get();
+            int32_t GW      = _sta_gateway->get();
+            int32_t MK      = _sta_netmask->get();
+            if (IP_mode != DHCP_MODE) {
+                IPAddress ip(IP), mask(MK), gateway(GW);
+                WiFi.config(ip, gateway, mask);
+            }
 
-    log_info("Connecting to STA SSID:" << SSID);
-    return ConnectSTA2AP(SSID, password);   // note: signature takes SSID/pass
-}
+            // Optional: TX power
+            esp_wifi_set_max_tx_power(78);
+
+            log_info("Connecting to STA SSID:" << SSID);
+            return ConnectSTA2AP(SSID, clean_pass.c_str());
+        }
 
         static bool StartAP() {
             //Sanity check
@@ -862,9 +897,7 @@ public:
 
             //Get parameters for AP
             const char* SSID = _ap_ssid->get();
-
             const char* password = _ap_password->get();
-
             int8_t channel = int8_t(_ap_channel->get());
 
             IPAddress ip(_ap_ip->get());
@@ -998,7 +1031,6 @@ public:
                 j.member("SSID", WiFi.SSID(i).c_str());
                 j.member("SIGNAL", getSignal(WiFi.RSSI(i)));
                 j.member("IS_PROTECTED", WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-                //            j->member("IS_PROTECTED", WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "0" : "1");
                 j.end_object();
             }
             WiFi.scanDelete();
@@ -1039,10 +1071,12 @@ public:
             new WebCommand(NULL, WEBCMD, WG, "ESP111", "System/IP", showIP);
             new WebCommand("IP=ipaddress MSK=netmask GW=gateway", WEBCMD, WA, "ESP103", "Sta/Setup", showSetStaParams);
 
-// Helpers for password state + change with confirmation
-new WebCommand(NULL, WEBCMD, WG, "ESP114", "WiFi/PasswordState", showPasswordState);
-new WebCommand("PASS=password", WEBCMD, WA, "ESP115", "WiFi/SetStaPassword", setStaPasswordAndConfirm);
-new WebCommand(NULL, WEBCMD, WG, "ESP116", "WiFi/ShowStaPassword", showStaPasswordPlain);
+            // Helpers for password state + change with confirmation
+            new WebCommand(NULL, WEBCMD, WG, "ESP114", "WiFi/PasswordState", showPasswordState);
+            new WebCommand("PASS=password", WEBCMD, WA, "ESP115", "WiFi/SetStaPassword", setStaPasswordAndConfirm);
+            // NOTE: avoid clashing with ESP116 above
+            new WebCommand(NULL, WEBCMD, WG, "ESP120", "WiFi/ShowStaPassword", showStaPasswordPlain);
+
             //stop active services
             // wifi_services.end();
 
@@ -1110,9 +1144,6 @@ new WebCommand(NULL, WEBCMD, WG, "ESP116", "WiFi/ShowStaPassword", showStaPasswo
         void poll() {
             //to avoid mixed mode due to scan network
             if (WiFi.getMode() == WIFI_AP_STA) {
-                // In principle it should be sufficient to check for != WIFI_SCAN_RUNNING,
-                // but that does not work well.  Doing so makes scans in AP mode unreliable.
-                // Sometimes the first try works, but subsequent scans fail.
                 if (WiFi.scanComplete() >= 0) {
                     WiFi.enableSTA(false);
                 }
@@ -1148,17 +1179,20 @@ static Error showPasswordState(const char* parameter, AuthenticationLevel auth_l
 
 static Error setStaPasswordAndConfirm(const char* parameter, AuthenticationLevel auth_level, Channel& out) {
     // Expect: PASS=yourpassword  (use PASS="" to clear)
-    std::string pass;
-    if (!get_param(parameter, "PASS", pass)) {
+    std::string pass_raw;
+    if (!get_param(parameter, "PASS", pass_raw)) {
         log_msg_to(out, "Missing PASS parameter");
         return Error::InvalidValue;
     }
-    Error e = _sta_password->setStringValue(pass);
+
+    // sanitize before saving to ensure no accidental SSID token/concat gets stored
+    std::string cleaned = extract_password_only(pass_raw, _sta_ssid ? _sta_ssid->get() : "");
+    Error e = _sta_password->setStringValue(cleaned);
     if (e != Error::Ok) {
         log_msg_to(out, "Sta/Password NOT changed (need >=8 chars unless clearing).");
         return e;
     }
-    std::string echo = std::string("Sta/Password changed to: ") + pass;
+    std::string echo = std::string("Sta/Password changed to: ") + cleaned;
     log_msg_to(out, echo.c_str());
     return Error::Ok;
 }
@@ -1171,7 +1205,5 @@ static Error showStaPasswordPlain(const char* parameter, AuthenticationLevel aut
     return Error::Ok;
 }
 
-
-
-    ModuleFactory::InstanceBuilder<WiFiConfig> __attribute__((init_priority(105))) wifi_module("wifi", true);
-}
+ModuleFactory::InstanceBuilder<WiFiConfig> __attribute__((init_priority(105))) wifi_module("wifi", true);
+} // namespace WebUI
